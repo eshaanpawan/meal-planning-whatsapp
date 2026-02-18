@@ -31,7 +31,6 @@ function onOpen() {
     .addItem('Step 2: Finalize Plan', 'finalizePlan')
     .addSeparator()
     .addItem('Recalculate Grocery List', 'calculateGroceryList')
-    .addItem('Log Waste Entry', 'manualWasteEntry')
     .addSeparator()
     .addItem('Send Today Lunch Now', 'sendTodayLunchNow')
     .addItem('Send Today Dinner Now', 'sendTodayDinnerNow')
@@ -52,7 +51,6 @@ function initialSetup() {
   createDraftPlanSheet(ss);
   createWeeklyPlanSheet(ss);
   createGroceryListSheet(ss);
-  createWasteCounterSheet(ss);
   createAttendanceLogSheet(ss);
 
   // Populate meal DB
@@ -222,45 +220,6 @@ function createGroceryListSheet(ss) {
     .requireCheckbox()
     .build();
   sheet.getRange(2, 5, 100, 1).setDataValidation(checkboxRule);
-
-  return sheet;
-}
-
-function createWasteCounterSheet(ss) {
-  let sheet = ss.getSheetByName('Waste Counter');
-  if (!sheet) {
-    sheet = ss.insertSheet('Waste Counter');
-  } else {
-    sheet.clear();
-  }
-
-  // Summary section
-  const summaryHeaders = ['Member', 'This Month', 'Last Month', 'All Time', 'Estimated Waste (Rs)'];
-  sheet.getRange(1, 1, 1, summaryHeaders.length).setValues([summaryHeaders]);
-  sheet.getRange(1, 1, 1, summaryHeaders.length)
-    .setBackground('#c5221f')
-    .setFontColor('white')
-    .setFontWeight('bold');
-
-  // Add member rows
-  const memberRows = CONFIG.MEMBERS.map(name => [name, 0, 0, 0, 0]);
-  sheet.getRange(2, 1, memberRows.length, summaryHeaders.length).setValues(memberRows);
-
-  // Detailed log section starting at row 8
-  sheet.getRange(7, 1).setValue('DETAILED LOG').setFontWeight('bold').setFontSize(12);
-  const logHeaders = ['Date', 'Meal', 'Member', 'Dish', 'Reported By'];
-  sheet.getRange(8, 1, 1, logHeaders.length).setValues([logHeaders]);
-  sheet.getRange(8, 1, 1, logHeaders.length)
-    .setBackground('#c5221f')
-    .setFontColor('white')
-    .setFontWeight('bold');
-
-  sheet.setFrozenRows(1);
-  sheet.setColumnWidth(1, 120);
-  sheet.setColumnWidth(2, 100);
-  sheet.setColumnWidth(3, 100);
-  sheet.setColumnWidth(4, 200);
-  sheet.setColumnWidth(5, 150);
 
   return sheet;
 }
@@ -1249,158 +1208,6 @@ function buildMealLookup(dbSheet) {
   return lookup;
 }
 
-// --- Scheduled: Post-meal waste check ---
-function sendLunchWasteCheck() {
-  sendWasteCheck('Lunch');
-}
-
-function sendDinnerWasteCheck() {
-  sendWasteCheck('Dinner');
-}
-
-function sendWasteCheck(mealType) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const planSheet = ss.getSheetByName('Weekly Plan');
-  const data = planSheet.getDataRange().getValues();
-
-  const today = new Date();
-  const todayStr = Utilities.formatDate(today, CONFIG.TIMEZONE, 'dd-MMM-yyyy');
-
-  for (let i = 1; i < data.length; i++) {
-    const rowDate = Utilities.formatDate(new Date(data[i][0]), CONFIG.TIMEZONE, 'dd-MMM-yyyy');
-    if (rowDate === todayStr && data[i][2] === mealType) {
-      const dish = data[i][3];
-
-      // Only check members who were IN
-      const members = CONFIG.MEMBERS;
-      let inMembers = [];
-      for (let m = 0; m < members.length; m++) {
-        if (data[i][5 + m] === 'IN') {
-          inMembers.push(members[m]);
-        }
-      }
-
-      if (inMembers.length > 0) {
-        let message = `${mealType === 'Lunch' ? 'Dopahar' : 'Raat'} ka khana ho gaya!\n\n`;
-        message += `${dish}\n\n`;
-        message += `In logon ne khana tha:\n`;
-        message += inMembers.map((name, idx) => `${idx + 1}. ${name}`).join('\n');
-        message += `\n\nKisi ne nahi khaya toh uska naam likh do. Nahi toh "sab ok" likh do.`;
-
-        // Send as voice note, fallback to text
-        const audioBlob = textToSpeechHindi(message);
-        if (audioBlob && sendVoiceNote(audioBlob)) {
-          Logger.log('Waste check sent as voice note');
-        } else {
-          sendWhatsAppMessage(message);
-        }
-      }
-      break;
-    }
-  }
-}
-
-// ===================== WASTE COUNTER ========================
-function logWaste(memberName, date, mealType, dishName, reportedBy) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const wasteSheet = ss.getSheetByName('Waste Counter');
-
-  // Add to detailed log
-  const lastRow = Math.max(wasteSheet.getLastRow(), 8);
-  wasteSheet.getRange(lastRow + 1, 1, 1, 5).setValues([
-    [date, mealType, memberName, dishName, reportedBy]
-  ]);
-
-  // Update summary counts
-  updateWasteSummary();
-}
-
-function updateWasteSummary() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const wasteSheet = ss.getSheetByName('Waste Counter');
-
-  const now = new Date();
-  const thisMonth = now.getMonth();
-  const thisYear = now.getFullYear();
-  const lastMonth = thisMonth === 0 ? 11 : thisMonth - 1;
-  const lastMonthYear = thisMonth === 0 ? thisYear - 1 : thisYear;
-
-  // Get all log entries (starting from row 9)
-  const lastRow = wasteSheet.getLastRow();
-  if (lastRow < 9) return;
-
-  const logData = wasteSheet.getRange(9, 1, lastRow - 8, 5).getValues();
-
-  // Count per member
-  const counts = {};
-  CONFIG.MEMBERS.forEach(m => {
-    counts[m] = { thisMonth: 0, lastMonth: 0, allTime: 0 };
-  });
-
-  for (const row of logData) {
-    const date = new Date(row[0]);
-    const member = row[2];
-    if (!counts[member]) continue;
-
-    counts[member].allTime++;
-
-    if (date.getMonth() === thisMonth && date.getFullYear() === thisYear) {
-      counts[member].thisMonth++;
-    }
-    if (date.getMonth() === lastMonth && date.getFullYear() === lastMonthYear) {
-      counts[member].lastMonth++;
-    }
-  }
-
-  // Estimate Rs 150 per wasted meal portion
-  const costPerWaste = 150;
-
-  // Update summary rows (rows 2-5)
-  for (let i = 0; i < CONFIG.MEMBERS.length; i++) {
-    const member = CONFIG.MEMBERS[i];
-    const c = counts[member];
-    wasteSheet.getRange(i + 2, 2, 1, 4).setValues([
-      [c.thisMonth, c.lastMonth, c.allTime, c.allTime * costPerWaste]
-    ]);
-  }
-}
-
-// Manual waste entry via menu (for when someone reports in WhatsApp)
-function manualWasteEntry() {
-  const ui = SpreadsheetApp.getUi();
-
-  const memberResponse = ui.prompt('Who wasted food?', 'Enter name (Devansh/Puneeth/Ron/Eshaan):', ui.ButtonSet.OK_CANCEL);
-  if (memberResponse.getSelectedButton() !== ui.Button.OK) return;
-  const member = memberResponse.getResponseText().trim();
-
-  if (!CONFIG.MEMBERS.includes(member)) {
-    ui.alert('Invalid member name. Use: ' + CONFIG.MEMBERS.join(', '));
-    return;
-  }
-
-  const mealResponse = ui.prompt('Which meal?', 'Lunch or Dinner:', ui.ButtonSet.OK_CANCEL);
-  if (mealResponse.getSelectedButton() !== ui.Button.OK) return;
-  const meal = mealResponse.getResponseText().trim();
-
-  // Get today's dish
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const planSheet = ss.getSheetByName('Weekly Plan');
-  const data = planSheet.getDataRange().getValues();
-  const todayStr = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd-MMM-yyyy');
-
-  let dishName = 'Unknown';
-  for (let i = 1; i < data.length; i++) {
-    const rowDate = Utilities.formatDate(new Date(data[i][0]), CONFIG.TIMEZONE, 'dd-MMM-yyyy');
-    if (rowDate === todayStr && data[i][2].toLowerCase() === meal.toLowerCase()) {
-      dishName = data[i][3];
-      break;
-    }
-  }
-
-  logWaste(member, new Date(), meal, dishName, 'Manual Entry');
-  ui.alert(`Logged: ${member} wasted ${meal} (${dishName})`);
-}
-
 // ===================== TRIGGERS SETUP =======================
 function setupTriggers() {
   // Remove existing triggers first
@@ -1427,29 +1234,11 @@ function setupTriggers() {
     .atHour(13)
     .create();
 
-  // Daily 2:30 PM - Lunch waste check
-  ScriptApp.newTrigger('sendLunchWasteCheck')
-    .timeBased()
-    .everyDays(1)
-    .atHour(14)
-    .nearMinute(30)
-    .create();
-
-  // Daily 10 PM - Dinner waste check (same as lunch send, slightly offset)
-  ScriptApp.newTrigger('sendDinnerWasteCheck')
-    .timeBased()
-    .everyDays(1)
-    .atHour(22)
-    .nearMinute(15)
-    .create();
-
   SpreadsheetApp.getUi().alert(
     'Triggers set up!\n\n' +
     '- Sunday 8 AM: Auto-generate draft plan (you review & finalize)\n' +
     '- Daily 10 PM: Send next day lunch to WhatsApp\n' +
-    '- Daily 1 PM: Send today dinner to WhatsApp\n' +
-    '- Daily 2:30 PM: Lunch waste check\n' +
-    '- Daily 10:15 PM: Dinner waste check'
+    '- Daily 1 PM: Send today dinner to WhatsApp'
   );
 }
 
